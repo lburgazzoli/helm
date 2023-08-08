@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sigs.k8s.io/yaml"
 	"strings"
 	"sync"
 	"time"
@@ -601,6 +602,34 @@ func deleteResource(info *resource.Info, policy metav1.DeletionPropagation) erro
 	return err
 }
 
+func removeNilValues(v reflect.Value, parent reflect.Value) {
+	for v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {
+		v = v.Elem()
+	}
+	switch v.Kind() {
+	case reflect.Array, reflect.Slice:
+		for i := 0; i < v.Len(); i++ {
+			removeNilValues(v.Index(i), v)
+		}
+	case reflect.Map:
+		for _, k := range v.MapKeys() {
+			switch c := v.MapIndex(k); {
+			case !c.IsValid():
+				// Skip keys previously deleted
+				continue
+			case c.IsNil(), c.Elem().Kind() == reflect.Map && len(c.Elem().MapKeys()) == 0:
+				v.SetMapIndex(k, reflect.Value{})
+			default:
+				removeNilValues(c, v)
+			}
+		}
+		// Back process the parent map in case it has been emptied so that it's deleted as well
+		if len(v.MapKeys()) == 0 && parent.Kind() == reflect.Map {
+			removeNilValues(parent, reflect.Value{})
+		}
+	}
+}
+
 func createPatch(target *resource.Info, current runtime.Object) ([]byte, types.PatchType, error) {
 	oldData, err := json.Marshal(current)
 	if err != nil {
@@ -638,7 +667,25 @@ func createPatch(target *resource.Info, current runtime.Object) ([]byte, types.P
 
 	if isUnstructured || isCRD {
 		// fall back to generic JSON merge patch
-		patch, err := jsonpatch.CreateMergePatch(oldData, newData)
+		patch, err := jsonpatch.CreateMergePatch(currentData, newData)
+
+		// special handling for unstructured
+		if isUnstructured {
+			// Remove null fields from the JSON merge patch, so that values
+			// managed by controllers server-side are not deleted.
+			var positivePatch map[string]interface{}
+			err = json.Unmarshal(patch, &positivePatch)
+			if err != nil {
+				return nil, types.MergePatchType, errors.Wrap(err, "serializing patch")
+			}
+
+			removeNilValues(reflect.ValueOf(positivePatch), reflect.Value{})
+			// Return an empty patch if no keys remain
+			if len(positivePatch) == 0 {
+				return nil, types.MergePatchType, nil
+			}
+		}
+
 		return patch, types.MergePatchType, err
 	}
 
@@ -649,6 +696,14 @@ func createPatch(target *resource.Info, current runtime.Object) ([]byte, types.P
 
 	patch, err := strategicpatch.CreateThreeWayMergePatch(oldData, newData, currentData, patchMeta, true)
 	return patch, types.StrategicMergePatchType, err
+}
+
+func prettyJson(str string) (string, error) {
+	var prettyJSON bytes.Buffer
+	if err := json.Indent(&prettyJSON, []byte(str), "", "    "); err != nil {
+		return "", err
+	}
+	return prettyJSON.String(), nil
 }
 
 func updateResource(c *Client, target *resource.Info, currentObj runtime.Object, force bool) error {
@@ -667,6 +722,15 @@ func updateResource(c *Client, target *resource.Info, currentObj runtime.Object,
 		}
 		c.Log("Replaced %q with kind %s for kind %s", target.Name, currentObj.GetObjectKind().GroupVersionKind().Kind, kind)
 	} else {
+		cd, err := yaml.Marshal(currentObj)
+		if err != nil {
+			return errors.Wrap(err, "failed to pretty print current")
+		}
+		td, err := yaml.Marshal(target.Object)
+		if err != nil {
+			return errors.Wrap(err, "failed to pretty print target")
+		}
+
 		patch, patchType, err := createPatch(target, currentObj)
 		if err != nil {
 			return errors.Wrap(err, "failed to create patch")
@@ -681,8 +745,18 @@ func updateResource(c *Client, target *resource.Info, currentObj runtime.Object,
 			}
 			return nil
 		}
+
+		p, err := prettyJson(string(patch))
+		if err != nil {
+			return errors.Wrap(err, "failed to pretty print patch")
+		}
+
 		// send patch to server
-		c.Log("Patch %s %q in namespace %s", kind, target.Name, target.Namespace)
+		c.Log("Patch %s %q in namespace %s, %s", kind, target.Name, target.Namespace, p)
+
+		c.Log("current: %s", string(cd))
+		c.Log("target: %s", string(td))
+
 		obj, err = helper.Patch(target.Namespace, target.Name, patchType, patch, nil)
 		if err != nil {
 			return errors.Wrapf(err, "cannot patch %q with kind %s", target.Name, kind)
